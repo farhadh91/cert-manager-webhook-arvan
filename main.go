@@ -139,7 +139,7 @@ func (c *arvanDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 		return fmt.Errorf("Failed to validate config: %v", err)
 	}
 
-	recordName, domain := c.extractRecordName(ch.ResolvedFQDN)
+	recordName, domain := c.resolveZone(&cfg, apiSecret, ch.ResolvedFQDN, ch.ResolvedZone)
 	c.CleanUp(ch)
 	//{"type":"TXT","ttl":120,"name":"asds","cloud":false,"value":{"text":"asd"}}
 	vals := make(map[string]string)
@@ -184,10 +184,16 @@ func (c *arvanDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 // This is in order to facilitate multiple DNS validations for the same domain
 // concurrently.
 func (c *arvanDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
-	id, err := c.getRecordID(ch)
+	id, domain, err := c.getRecordID(ch)
 	if err != nil {
 		klog.Error(err)
 		return err
+	}
+	// Nothing to delete is a success: cert-manager also calls CleanUp for
+	// challenges that were never presented, or already cleaned up.
+	if id == "" {
+		klog.Infof("No TXT record holding this challenge key in %s, nothing to clean up", domain)
+		return nil
 	}
 	cfg, err := loadConfig(ch.Config)
 	if err != nil {
@@ -200,8 +206,6 @@ func (c *arvanDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 		return fmt.Errorf("Failed to validate config: %v", err)
 	}
 	// See we are not setting content-type header, since go-resty automatically detects Content-Type for you
-
-	domain := ch.ResolvedZone[:len(ch.ResolvedZone)-1]
 
 	client := resty.New()
 	resp, err := client.R().
@@ -304,61 +308,105 @@ func (c *arvanDNSProviderSolver) urlFactory(cfg *arvanDNSProviderConfig, uri str
 	}
 	return r.Replace(urlFormat)
 }
-func (c *arvanDNSProviderSolver) extractRecordName(fqdn string) (record, domain string) {
+
+// resolveZone returns the record name and the zone it has to be created in.
+// The zone cannot be derived from the fqdn alone: sub.example.com may be a
+// record inside example.com or a delegated zone of its own, and only the
+// account holding it knows which. So every possible parent is checked against
+// the api, longest first, and the first one that exists wins: a delegated
+// child zone is always longer than its parent.
+// Falls back to the zone cert-manager resolved over DNS when the api answers
+// for none of them.
+func (c *arvanDNSProviderSolver) resolveZone(cfg *arvanDNSProviderConfig, apiSecret, fqdn, resolvedZone string) (record, domain string) {
 	fqdn = util.UnFqdn(fqdn)
-	parts := strings.Split(fqdn, ".")
-	domain = strings.Join(parts[len(parts)-2:], ".")
-	klog.Infof("Request : %s => %s", fqdn, domain)
-	if idx := strings.Index(fqdn, "."+domain); idx != -1 {
-		return fqdn[:idx], domain
+	labels := strings.Split(fqdn, ".")
+	for i := 0; len(labels)-i >= 2; i++ {
+		// _acme-challenge.* is the record itself, never a hosted zone.
+		if strings.HasPrefix(labels[i], "_") {
+			continue
+		}
+		candidate := strings.Join(labels[i:], ".")
+		if c.zoneExists(cfg, apiSecret, candidate) {
+			klog.Infof("Request : %s => %s", fqdn, candidate)
+			return strings.TrimSuffix(strings.TrimSuffix(fqdn, candidate), "."), candidate
+		}
 	}
-	return fqdn, domain
+	domain = util.UnFqdn(resolvedZone)
+	klog.Warningf("No zone hosted on arvan matched %s, falling back to %s", fqdn, domain)
+	return strings.TrimSuffix(strings.TrimSuffix(fqdn, domain), "."), domain
 }
 
-func (c *arvanDNSProviderSolver) getRecordID(ch *v1alpha1.ChallengeRequest) (string, error) {
+// zoneExists reports whether the account hosts the given zone. It asks for the
+// dns-records of the zone, so it needs no endpoint beyond the ones this
+// webhook already uses. Anything other than a 200 means the zone is not usable
+// here, so the next candidate is tried.
+func (c *arvanDNSProviderSolver) zoneExists(cfg *arvanDNSProviderConfig, apiSecret, zone string) bool {
+	resp, err := resty.New().R().
+		SetAuthToken(apiSecret).
+		SetAuthScheme("Apikey").
+		SetHeader("Accept", "application/json").
+		SetQueryString("page=1&per_page=1").
+		Get(
+			c.urlFactory(
+				cfg,
+				"/cdn/4.0/domains/{domain}/dns-records",
+				"{domain}", zone,
+			))
+	if err != nil {
+		klog.Warningf("Could not check whether zone %s is hosted on arvan: %v", zone, err)
+		return false
+	}
+	return resp.StatusCode() == 200
+}
+
+// getRecordID returns the id of the TXT record holding this challenge's key,
+// along with the zone it lives in. An empty id means there is no such record.
+func (c *arvanDNSProviderSolver) getRecordID(ch *v1alpha1.ChallengeRequest) (string, string, error) {
 	cfg, err := loadConfig(ch.Config)
 	if err != nil {
 		klog.Error(err)
-		return "", err
+		return "", "", err
 	}
 	apiSecret, err := c.validateAndGetSecret(&cfg, ch.ResourceNamespace)
 	if err != nil {
 		klog.Errorf("Failed to validate config: %v", err)
-		return "", fmt.Errorf("Failed to validate config: %v", err)
+		return "", "", fmt.Errorf("Failed to validate config: %v", err)
 	}
-	recordName, domain := c.extractRecordName(ch.ResolvedFQDN)
-	recordName = strings.Replace(recordName, "-", "_", -1)
+	recordName, domain := c.resolveZone(&cfg, apiSecret, ch.ResolvedFQDN, ch.ResolvedZone)
+	search := strings.Replace(recordName, "-", "_", -1)
 
 	client := resty.New()
 	resp, err := client.R().
 		SetAuthToken(apiSecret).
 		SetAuthScheme("Apikey").
 		SetHeader("Accept", "application/json").
-		SetQueryString(fmt.Sprintf("search=%s&page=1&per_page=25", recordName)).
+		SetQueryString(fmt.Sprintf("search=%s&page=1&per_page=25", search)).
 		Get(
 			c.urlFactory(
 				&cfg,
 				"/cdn/4.0/domains/{domain}/dns-records",
 				"{domain}", domain,
 			))
-	klog.Info(resp.Request.URL, resp.Request.Header, resp.Request.Body, resp.StatusCode(), string(resp.Body()))
 
 	if err != nil {
 		klog.Error(err)
-		return "", err
+		return "", "", err
 	}
+	klog.Info(resp.Request.URL, resp.Request.Header, resp.Request.Body, resp.StatusCode(), string(resp.Body()))
 
 	recs := DNSRecords{}
 	err = json.Unmarshal(resp.Body(), &recs)
 	if err != nil {
 		klog.Error(err)
-		return "", err
+		return "", "", err
 	}
-	if len(recs.Data) == 1 {
-		return recs.Data[0].ID, nil
-	} else {
-		err = fmt.Errorf("Domain not Found")
-		klog.Error(err)
-		return "", err
+	// The search is a loose match, so pick the record by its exact name and by
+	// this challenge's key: a wildcard and its base domain are validated
+	// through the same name at the same time, and only ours may be touched.
+	for _, rec := range recs.Data {
+		if strings.EqualFold(rec.Name, recordName) && rec.Value["text"] == ch.Key {
+			return rec.ID, domain, nil
+		}
 	}
+	return "", domain, nil
 }
