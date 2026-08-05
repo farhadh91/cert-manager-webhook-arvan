@@ -16,9 +16,10 @@ import (
 // answers 404 for any other one, the way the real api does for a domain that
 // is not in the account.
 type fakeArvan struct {
-	server *httptest.Server
-	zones  map[string][]DNSRecord // zone -> records
-	nextID int
+	server   *httptest.Server
+	zones    map[string][]DNSRecord // zone -> records
+	requests []string               // "METHOD /path" of every call received
+	nextID   int
 }
 
 func newFakeArvan(zones ...string) *fakeArvan {
@@ -33,9 +34,12 @@ func newFakeArvan(zones ...string) *fakeArvan {
 func (f *fakeArvan) Close() { f.server.Close() }
 
 // handle serves the endpoints the solver uses:
-//   GET/POST /cdn/4.0/domains/{zone}/dns-records
-//   DELETE   /cdn/4.0/domains/{zone}/dns-records/{id}
+//
+//	GET/POST /cdn/4.0/domains/{zone}/dns-records
+//	DELETE   /cdn/4.0/domains/{zone}/dns-records/{id}
 func (f *fakeArvan) handle(w http.ResponseWriter, r *http.Request) {
+	f.requests = append(f.requests, r.Method+" "+r.URL.Path)
+
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(parts) < 5 || parts[2] != "domains" || parts[4] != "dns-records" {
 		http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
@@ -50,7 +54,12 @@ func (f *fakeArvan) handle(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case r.Method == http.MethodGet:
-		writeJSON(w, http.StatusOK, DNSRecords{Data: records})
+		// The real api ignores nothing here: the solver must not rely on the
+		// `search` parameter, so this returns the whole zone regardless.
+		out := DNSRecords{Data: records}
+		out.Meta.CurrentPage = 1
+		out.Meta.LastPage = 1
+		writeJSON(w, http.StatusOK, out)
 
 	case r.Method == http.MethodPost:
 		rec := DNSRecord{}
@@ -269,6 +278,65 @@ func TestCleanUpWithoutRecordSucceeds(t *testing.T) {
 	}
 }
 
+// TestPresentIsIdempotent: re-presenting the same challenge must not delete
+// and recreate the record. That gap leaves the name non-existent for a moment,
+// which is long enough for a resolver to cache NXDOMAIN and fail the
+// validation.
+func TestPresentIsIdempotent(t *testing.T) {
+	fake := newFakeArvan("example.com")
+	defer fake.Close()
+
+	solver := &arvanDNSProviderSolver{}
+	ch := fake.challenge(t, "_acme-challenge.sub.example.com.", "example.com.", "key-1")
+
+	if err := solver.Present(ch); err != nil {
+		t.Fatalf("Present #1: %v", err)
+	}
+	if err := solver.Present(ch); err != nil {
+		t.Fatalf("Present #2: %v", err)
+	}
+
+	if got := len(fake.zones["example.com"]); got != 1 {
+		t.Errorf("records after two Present calls = %d, want 1", got)
+	}
+	for _, req := range fake.requests {
+		if strings.HasPrefix(req, "DELETE ") {
+			t.Errorf("Present issued a delete: %s", req)
+		}
+	}
+}
+
+// TestFindsRecordAmongOtherTypes: the zone is listed in full rather than
+// searched, so records of other types must not break decoding. An A record
+// carries a null port, which is not a string.
+func TestFindsRecordAmongOtherTypes(t *testing.T) {
+	fake := newFakeArvan("example.com")
+	defer fake.Close()
+
+	fake.nextID++
+	fake.zones["example.com"] = append(fake.zones["example.com"], DNSRecord{
+		ID:    "a-record",
+		Type:  "a",
+		Name:  "www",
+		Value: map[string]interface{}{"ip": "192.0.2.1", "port": nil},
+	})
+
+	solver := &arvanDNSProviderSolver{}
+	ch := fake.challenge(t, "_acme-challenge.example.com.", "example.com.", "key-1")
+
+	if err := solver.Present(ch); err != nil {
+		t.Fatalf("Present: %v", err)
+	}
+	if err := solver.CleanUp(ch); err != nil {
+		t.Fatalf("CleanUp: %v", err)
+	}
+
+	left := fake.recordNames("example.com")
+	if len(left) != 1 || left[0] != "www" {
+		t.Errorf("records left = %v, want only the unrelated A record", left)
+	}
+}
+
 // TestCleanUpKeepsConcurrentChallenge: a wildcard and its base domain are
 // validated through the same record name at the same time, so cleaning up one
 // must leave the other's record in place.
@@ -291,7 +359,7 @@ func TestCleanUpKeepsConcurrentChallenge(t *testing.T) {
 	}
 
 	left := fake.zones["sub.example.com"]
-	if len(left) != 1 || left[0].Value["text"] != "key-base" {
+	if len(left) != 1 || left[0].Text() != "key-base" {
 		t.Errorf("records after cleanup = %v, want only the key-base record", left)
 	}
 }

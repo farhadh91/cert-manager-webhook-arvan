@@ -23,32 +23,43 @@ import (
 )
 
 // DNSRecord a DNS record
-//{
-//	"id": "497f6eca-6276-4993-bfeb-53cbbbba6f08",
-//	"type": "a",
-//	"name": "string",
-//	"value": { },
-//	"ttl": 120,
-//	"cloud": false,
-//	"upstream_https": "default",
-//	"ip_filter_mode":
-//	{},
-//	"can_delete": true,
-//	"is_protected": false,
-//	"created_at": "2019-08-24T14:15:22Z",
-//	"updated_at": "2019-08-24T14:15:22Z"
-//}
+//
+//	{
+//		"id": "497f6eca-6276-4993-bfeb-53cbbbba6f08",
+//		"type": "a",
+//		"name": "string",
+//		"value": { },
+//		"ttl": 120,
+//		"cloud": false,
+//		"upstream_https": "default",
+//		"ip_filter_mode":
+//		{},
+//		"can_delete": true,
+//		"is_protected": false,
+//		"created_at": "2019-08-24T14:15:22Z",
+//		"updated_at": "2019-08-24T14:15:22Z"
+//	}
 type DNSRecord struct {
-	ID    string            `json:"id,omitempty"`
-	Type  string            `json:"type"`
-	Name  string            `json:"name"`
-	Value map[string]string `json:"value"`
-	Cloud bool              `json:"cloud"`
-	TTL   int               `json:"ttl,omitempty"`
+	ID    string                 `json:"id,omitempty"`
+	Type  string                 `json:"type"`
+	Name  string                 `json:"name"`
+	Value map[string]interface{} `json:"value"`
+	Cloud bool                   `json:"cloud"`
+	TTL   int                    `json:"ttl,omitempty"`
+}
+
+// Text returns the payload of a TXT record.
+func (r DNSRecord) Text() string {
+	text, _ := r.Value["text"].(string)
+	return text
 }
 
 type DNSRecords struct {
 	Data []DNSRecord `json:"data"`
+	Meta struct {
+		CurrentPage int `json:"current_page"`
+		LastPage    int `json:"last_page"`
+	} `json:"meta"`
 }
 
 var GroupName = os.Getenv("GROUP_NAME")
@@ -139,10 +150,24 @@ func (c *arvanDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 		return fmt.Errorf("Failed to validate config: %v", err)
 	}
 
+	// Resolved once and reused below: every extra api call widens the window
+	// between the challenge starting and the record being visible.
 	recordName, domain := c.resolveZone(&cfg, apiSecret, ch.ResolvedFQDN, ch.ResolvedZone)
-	c.CleanUp(ch)
+
+	// Present has to tolerate being called repeatedly for the same challenge.
+	// Returning early when our record is already published avoids deleting and
+	// recreating it, which would leave the name briefly non-existent -- long
+	// enough for a resolver to cache the NXDOMAIN.
+	id, err := c.findRecordID(&cfg, apiSecret, domain, recordName, ch.Key)
+	if err != nil {
+		klog.Warningf("Could not list records of %s in %s: %v", recordName, domain, err)
+	} else if id != "" {
+		klog.Infof("TXT record %s in %s already holds this challenge key", recordName, domain)
+		return nil
+	}
+
 	//{"type":"TXT","ttl":120,"name":"asds","cloud":false,"value":{"text":"asd"}}
-	vals := make(map[string]string)
+	vals := make(map[string]interface{})
 	vals["text"] = ch.Key
 	record := DNSRecord{
 		Type:  "TXT",
@@ -166,7 +191,8 @@ func (c *arvanDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 				"{domain}", domain,
 			))
 
-	klog.Info(resp.Request.URL, resp.Request.Header, resp.Request.Body, resp.StatusCode(), string(resp.Body()))
+	// Request.Header is deliberately not logged: it carries the api key.
+	klog.Info(resp.Request.URL, resp.Request.Body, resp.StatusCode(), string(resp.Body()))
 
 	if err == nil {
 		if resp.StatusCode() != 201 {
@@ -184,17 +210,6 @@ func (c *arvanDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 // This is in order to facilitate multiple DNS validations for the same domain
 // concurrently.
 func (c *arvanDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
-	id, domain, err := c.getRecordID(ch)
-	if err != nil {
-		klog.Error(err)
-		return err
-	}
-	// Nothing to delete is a success: cert-manager also calls CleanUp for
-	// challenges that were never presented, or already cleaned up.
-	if id == "" {
-		klog.Infof("No TXT record holding this challenge key in %s, nothing to clean up", domain)
-		return nil
-	}
 	cfg, err := loadConfig(ch.Config)
 	if err != nil {
 		klog.Error(err)
@@ -204,6 +219,19 @@ func (c *arvanDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 	if err != nil {
 		klog.Errorf("Failed to validate config: %v", err)
 		return fmt.Errorf("Failed to validate config: %v", err)
+	}
+
+	recordName, domain := c.resolveZone(&cfg, apiSecret, ch.ResolvedFQDN, ch.ResolvedZone)
+	id, err := c.findRecordID(&cfg, apiSecret, domain, recordName, ch.Key)
+	if err != nil {
+		klog.Error(err)
+		return err
+	}
+	// Nothing to delete is a success: cert-manager also calls CleanUp for
+	// challenges that were never presented, or already cleaned up.
+	if id == "" {
+		klog.Infof("No TXT record holding this challenge key in %s, nothing to clean up", domain)
+		return nil
 	}
 	// See we are not setting content-type header, since go-resty automatically detects Content-Type for you
 
@@ -220,7 +248,8 @@ func (c *arvanDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 				"{id}", id,
 			))
 
-	klog.Info(resp.Request.URL, resp.Request.Header, resp.Request.Body, resp.StatusCode(), string(resp.Body()))
+	// Request.Header is deliberately not logged: it carries the api key.
+	klog.Info(resp.Request.URL, resp.Request.Body, resp.StatusCode(), string(resp.Body()))
 
 	if err != nil {
 		if resp == nil {
@@ -359,54 +388,62 @@ func (c *arvanDNSProviderSolver) zoneExists(cfg *arvanDNSProviderConfig, apiSecr
 	return resp.StatusCode() == 200
 }
 
-// getRecordID returns the id of the TXT record holding this challenge's key,
-// along with the zone it lives in. An empty id means there is no such record.
-func (c *arvanDNSProviderSolver) getRecordID(ch *v1alpha1.ChallengeRequest) (string, string, error) {
-	cfg, err := loadConfig(ch.Config)
-	if err != nil {
-		klog.Error(err)
-		return "", "", err
-	}
-	apiSecret, err := c.validateAndGetSecret(&cfg, ch.ResourceNamespace)
-	if err != nil {
-		klog.Errorf("Failed to validate config: %v", err)
-		return "", "", fmt.Errorf("Failed to validate config: %v", err)
-	}
-	recordName, domain := c.resolveZone(&cfg, apiSecret, ch.ResolvedFQDN, ch.ResolvedZone)
-	search := strings.Replace(recordName, "-", "_", -1)
+// maxRecordPages caps pagination so a very large zone cannot spin forever.
+const maxRecordPages = 20
 
+// findRecordID returns the id of the TXT record of the zone that carries this
+// record name and this challenge's key. An empty id means there is no such
+// record.
+//
+// The zone is listed and filtered here rather than through the api's `search`
+// parameter: that search has been observed returning no rows for a record that
+// exists, which silently turns cleanup into a no-op and leaves the record
+// behind. Matching on the exact name and the key also keeps a wildcard and its
+// base domain, which are validated through the same record name at the same
+// time, from deleting each other's record.
+func (c *arvanDNSProviderSolver) findRecordID(cfg *arvanDNSProviderConfig, apiSecret, domain, recordName, key string) (string, error) {
 	client := resty.New()
-	resp, err := client.R().
-		SetAuthToken(apiSecret).
-		SetAuthScheme("Apikey").
-		SetHeader("Accept", "application/json").
-		SetQueryString(fmt.Sprintf("search=%s&page=1&per_page=25", search)).
-		Get(
-			c.urlFactory(
-				&cfg,
-				"/cdn/4.0/domains/{domain}/dns-records",
-				"{domain}", domain,
-			))
 
-	if err != nil {
-		klog.Error(err)
-		return "", "", err
-	}
-	klog.Info(resp.Request.URL, resp.Request.Header, resp.Request.Body, resp.StatusCode(), string(resp.Body()))
+	for page := 1; page <= maxRecordPages; page++ {
+		resp, err := client.R().
+			SetAuthToken(apiSecret).
+			SetAuthScheme("Apikey").
+			SetHeader("Accept", "application/json").
+			SetQueryString(fmt.Sprintf("page=%d&per_page=100", page)).
+			Get(
+				c.urlFactory(
+					cfg,
+					"/cdn/4.0/domains/{domain}/dns-records",
+					"{domain}", domain,
+				))
+		if err != nil {
+			klog.Error(err)
+			return "", err
+		}
+		// Request.Header is deliberately not logged: it carries the api key.
+		klog.Info(resp.Request.URL, resp.StatusCode())
 
-	recs := DNSRecords{}
-	err = json.Unmarshal(resp.Body(), &recs)
-	if err != nil {
-		klog.Error(err)
-		return "", "", err
-	}
-	// The search is a loose match, so pick the record by its exact name and by
-	// this challenge's key: a wildcard and its base domain are validated
-	// through the same name at the same time, and only ours may be touched.
-	for _, rec := range recs.Data {
-		if strings.EqualFold(rec.Name, recordName) && rec.Value["text"] == ch.Key {
-			return rec.ID, domain, nil
+		if resp.StatusCode() != 200 {
+			err = fmt.Errorf("Error listing dns records of %s: %s", domain, string(resp.Body()))
+			klog.Error(err)
+			return "", err
+		}
+
+		recs := DNSRecords{}
+		if err := json.Unmarshal(resp.Body(), &recs); err != nil {
+			klog.Error(err)
+			return "", err
+		}
+
+		for _, rec := range recs.Data {
+			if strings.EqualFold(rec.Type, "TXT") && strings.EqualFold(rec.Name, recordName) && rec.Text() == key {
+				return rec.ID, nil
+			}
+		}
+
+		if len(recs.Data) == 0 || page >= recs.Meta.LastPage {
+			break
 		}
 	}
-	return "", domain, nil
+	return "", nil
 }
