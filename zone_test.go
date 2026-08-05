@@ -313,13 +313,22 @@ func TestFindsRecordAmongOtherTypes(t *testing.T) {
 	fake := newFakeArvan("example.com")
 	defer fake.Close()
 
-	fake.nextID++
-	fake.zones["example.com"] = append(fake.zones["example.com"], DNSRecord{
-		ID:    "a-record",
-		Type:  "a",
-		Name:  "www",
-		Value: map[string]interface{}{"ip": "192.0.2.1", "port": nil},
-	})
+	fake.zones["example.com"] = append(fake.zones["example.com"],
+		// An a record: object valued, with a null field.
+		DNSRecord{
+			ID:    "a-record",
+			Type:  "a",
+			Name:  "www",
+			Value: json.RawMessage(`{"ip":"192.0.2.1","port":null}`),
+		},
+		// An ns record: array valued. This is what broke listing a real zone.
+		DNSRecord{
+			ID:    "ns-record",
+			Type:  "ns",
+			Name:  "sub",
+			Value: json.RawMessage(`[{"host":"a.ns.example.net"},{"host":"b.ns.example.net"}]`),
+		},
+	)
 
 	solver := &arvanDNSProviderSolver{}
 	ch := fake.challenge(t, "_acme-challenge.example.com.", "example.com.", "key-1")
@@ -332,8 +341,8 @@ func TestFindsRecordAmongOtherTypes(t *testing.T) {
 	}
 
 	left := fake.recordNames("example.com")
-	if len(left) != 1 || left[0] != "www" {
-		t.Errorf("records left = %v, want only the unrelated A record", left)
+	if len(left) != 2 || left[0] != "www" || left[1] != "sub" {
+		t.Errorf("records left = %v, want the unrelated a and ns records", left)
 	}
 }
 

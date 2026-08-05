@@ -39,19 +39,39 @@ import (
 //		"created_at": "2019-08-24T14:15:22Z",
 //		"updated_at": "2019-08-24T14:15:22Z"
 //	}
+//
+// DNSRecord is the read model. `value` is left raw on purpose: its shape
+// depends on the record type, and a zone listing contains every type. An ns
+// record answers with an array, so decoding it into a map fails and takes the
+// whole listing down with it.
 type DNSRecord struct {
-	ID    string                 `json:"id,omitempty"`
-	Type  string                 `json:"type"`
-	Name  string                 `json:"name"`
-	Value map[string]interface{} `json:"value"`
-	Cloud bool                   `json:"cloud"`
-	TTL   int                    `json:"ttl,omitempty"`
+	ID    string          `json:"id,omitempty"`
+	Type  string          `json:"type"`
+	Name  string          `json:"name"`
+	Value json.RawMessage `json:"value"`
+	Cloud bool            `json:"cloud"`
+	TTL   int             `json:"ttl,omitempty"`
 }
 
-// Text returns the payload of a TXT record.
+// Text returns the payload of a TXT record, or "" for any other shape.
 func (r DNSRecord) Text() string {
-	text, _ := r.Value["text"].(string)
-	return text
+	var value struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(r.Value, &value); err != nil {
+		return ""
+	}
+	return value.Text
+}
+
+// dnsRecordRequest is the create payload, where the value shape is ours to
+// pick and is always a TXT record.
+type dnsRecordRequest struct {
+	Type  string            `json:"type"`
+	Name  string            `json:"name"`
+	Value map[string]string `json:"value"`
+	Cloud bool              `json:"cloud"`
+	TTL   int               `json:"ttl,omitempty"`
 }
 
 type DNSRecords struct {
@@ -167,9 +187,9 @@ func (c *arvanDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 	}
 
 	//{"type":"TXT","ttl":120,"name":"asds","cloud":false,"value":{"text":"asd"}}
-	vals := make(map[string]interface{})
+	vals := make(map[string]string)
 	vals["text"] = ch.Key
-	record := DNSRecord{
+	record := dnsRecordRequest{
 		Type:  "TXT",
 		Name:  recordName,
 		Value: vals,
