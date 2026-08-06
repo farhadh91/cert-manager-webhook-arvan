@@ -1,0 +1,19 @@
+apiVersion: v2
+name: cert-manager-webhook-arvan
+description: cert-manager DNS01 webhook solver for ArvanCloud, packaged for OKD/OpenShift
+type: application
+version: 0.1.0
+appVersion: "0.4"
+home: https://github.com/kiandigital/cert-manager-webhook-arvan/tree/master/deploy/arvan-webhook-okd
+annotations:
+  category: CertManager
+keywords:
+  - cert-manager
+  - arvancloud
+  - openshift
+  - okd
+  - tls
+  - certificate
+sources:
+  - https://github.com/kiandigital/cert-manager-webhook-arvan
+  - https://cert-manager.io/

@@ -1,0 +1,64 @@
+---
+# Self-signed issuer, used only to mint the CA below.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "cert-manager-webhook-arvan.selfSignedIssuer" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "cert-manager-webhook-arvan.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+
+---
+# CA that signs the webhook's serving certificate. Its public half is injected
+# into the APIService caBundle by cainjector.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "cert-manager-webhook-arvan.rootCACertificate" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "cert-manager-webhook-arvan.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "cert-manager-webhook-arvan.rootCACertificate" . }}
+  duration: 43800h # 5y
+  issuerRef:
+    name: {{ include "cert-manager-webhook-arvan.selfSignedIssuer" . }}
+  # X.509 caps commonName at 64 bytes, and fullname alone can reach 63, so
+  # this is truncated. The CA's CN is cosmetic; identity comes from the
+  # serving certificate's dnsNames.
+  commonName: {{ printf "ca.%s" (include "cert-manager-webhook-arvan.fullname" .) | trunc 64 | trimSuffix "-" | trimSuffix "." | quote }}
+  isCA: true
+
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "cert-manager-webhook-arvan.rootCAIssuer" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "cert-manager-webhook-arvan.labels" . | nindent 4 }}
+spec:
+  ca:
+    secretName: {{ include "cert-manager-webhook-arvan.rootCACertificate" . }}
+
+---
+# Serving certificate for the webhook, valid for the in-cluster Service name.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "cert-manager-webhook-arvan.servingCertificate" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "cert-manager-webhook-arvan.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "cert-manager-webhook-arvan.servingCertificate" . }}
+  duration: 8760h # 1y
+  issuerRef:
+    name: {{ include "cert-manager-webhook-arvan.rootCAIssuer" . }}
+  dnsNames:
+    - {{ include "cert-manager-webhook-arvan.fullname" . }}
+    - {{ include "cert-manager-webhook-arvan.fullname" . }}.{{ .Release.Namespace }}
+    - {{ include "cert-manager-webhook-arvan.fullname" . }}.{{ .Release.Namespace }}.svc
+    - {{ include "cert-manager-webhook-arvan.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local

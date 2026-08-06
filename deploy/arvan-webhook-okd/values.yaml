@@ -1,0 +1,76 @@
+# The GroupName identifies this webhook's API group. It must be unique in the
+# cluster and must match the `groupName` in every Issuer that uses this solver.
+groupName: hbahadorzadeh.github
+
+# Where cert-manager itself runs. Its ServiceAccount is granted permission to
+# call this webhook.
+#   Red Hat cert-manager operator : namespace cert-manager, sa cert-manager
+#   community cert-manager (OLM)  : namespace cert-manager, sa cert-manager
+certManager:
+  namespace: cert-manager
+  serviceAccountName: cert-manager
+
+image:
+  repository: farhadh91/cert-manager-webhook-arvan
+  tag: "0.4"
+  pullPolicy: IfNotPresent
+
+# Name of the Secret holding the ArvanCloud api key. It must exist in the
+# release namespace; the webhook is granted read access to exactly this one.
+credentialsSecretRef: arvan-credentials
+
+replicaCount: 1
+
+nameOverride: ""
+fullnameOverride: ""
+
+deployment:
+  loglevel: 2
+
+service:
+  type: ClusterIP
+  port: 443
+
+# Port the webhook listens on inside the pod. Must stay above 1024: under the
+# OpenShift restricted-v2 SCC the container runs as an arbitrary non-root UID,
+# which is not allowed to bind privileged ports.
+securePort: 8443
+
+# Allow the kube-apiserver to reach the webhook pod. Required on clusters that
+# apply a default-deny NetworkPolicy to new namespaces, where the APIService
+# otherwise sits at MissingEndpoints/FailedDiscoveryCheck with a healthy pod.
+# Harmless elsewhere: it opens the webhook port and nothing else.
+networkPolicy:
+  enabled: true
+
+# Pod and container security context. The defaults satisfy the restricted-v2
+# SCC, so no custom SCC and no anyuid is needed.
+# runAsUser and fsGroup are deliberately not set: OpenShift assigns a UID from
+# the namespace's allocated range, and pinning one here would be rejected.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+podAnnotations: {}
